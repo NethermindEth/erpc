@@ -15,7 +15,7 @@ concurrency:
 
 env:
   DOCKER_REGISTRY: nethermind.jfrog.io
-  REPO_DEV: angkor-oci-virtual
+  REPO_DEV: angkor-oci-local
 
 jobs:
   build:
