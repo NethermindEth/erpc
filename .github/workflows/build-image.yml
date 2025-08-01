@@ -34,7 +34,7 @@ jobs:
         with:
           registry: ${{ env.DOCKER_REGISTRY }}
           username: ${{ secrets.ARTIFACTORY_ANGKOR_USERNAME }}
-          password: ${{ secrets.ARTIFACTORY_TOKEN }}
+          password: ${{ secrets.ARTIFACTORY_ANGKOR_DEVELOPER_TOKEN }}
 
       - name: Build & push Docker images
         uses: docker/build-push-action@471d1dc4e07e5cdedd4c2171150001c434f0b7a4
