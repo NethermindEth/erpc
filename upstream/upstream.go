@@ -304,7 +304,7 @@ func (u *Upstream) Forward(ctx context.Context, nrq *common.NormalizedRequest, b
 		common.SetTraceSpanError(span, err)
 		return nil, common.NewErrUpstreamRequest(
 			err,
-			cfg.Id,
+			u,
 			u.networkId,
 			method,
 			time.Since(startTime),
@@ -437,10 +437,15 @@ func (u *Upstream) Forward(ctx context.Context, nrq *common.NormalizedRequest, b
 				}
 
 				timer.ObserveDuration(false)
+				// We're converting a response+error into a pure error. Release the response to avoid retention.
+				if nrs != nil {
+					nrs.Release()
+					nrs = nil
+				}
 				if exec != nil {
 					return nil, common.NewErrUpstreamRequest(
 						errCall,
-						cfg.Id,
+						u,
 						u.networkId,
 						method,
 						time.Since(startTime),
@@ -451,7 +456,7 @@ func (u *Upstream) Forward(ctx context.Context, nrq *common.NormalizedRequest, b
 				} else {
 					return nil, common.NewErrUpstreamRequest(
 						errCall,
-						cfg.Id,
+						u,
 						u.networkId,
 						method,
 						time.Since(startTime),
@@ -550,7 +555,7 @@ func (u *Upstream) Forward(ctx context.Context, nrq *common.NormalizedRequest, b
 	default:
 		err := common.NewErrUpstreamClientInitialization(
 			fmt.Errorf("unsupported client type during forward: %s", clientType),
-			cfg.Id,
+			u,
 		)
 		common.SetTraceSpanError(span, err)
 		return nil, err
@@ -585,6 +590,8 @@ func (u *Upstream) EvmGetChainId(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	// Ensure response is always released after we parse it
+	defer resp.Release()
 
 	jrr, err := resp.JsonRpcResponse()
 	if err != nil {
@@ -930,7 +937,7 @@ func (u *Upstream) detectFeatures(ctx context.Context) error {
 						Code:  "ErrUpstreamChainIdDetectionFailed",
 						Cause: err,
 					},
-					cfg.Id,
+					u,
 				)
 			}
 			cfg.Evm.ChainId, err = strconv.ParseInt(nid, 10, 64)
@@ -940,7 +947,7 @@ func (u *Upstream) detectFeatures(ctx context.Context) error {
 						Code:  "ErrUpstreamChainIdDetectionFailed",
 						Cause: err,
 					},
-					cfg.Id,
+					u,
 				)
 			}
 		}

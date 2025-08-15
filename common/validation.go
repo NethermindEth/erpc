@@ -5,8 +5,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/erpc/erpc/util"
+	"github.com/rs/zerolog/log"
 )
 
 func (c *Config) Validate() error {
@@ -69,8 +71,8 @@ func (s *ServerConfig) Validate() error {
 			if s.HttpHostV4 == nil {
 				return fmt.Errorf("server.listenV4 is true but server.httpHostV4 is not set")
 			}
-			if s.HttpPort == nil {
-				return fmt.Errorf("server.listenV4 is true but server.httpPort is not set")
+			if s.HttpPortV4 == nil {
+				return fmt.Errorf("server.listenV4 is true but server.httpPortV4 is not set")
 			}
 		}
 	}
@@ -79,8 +81,8 @@ func (s *ServerConfig) Validate() error {
 			if s.HttpHostV6 == nil {
 				return fmt.Errorf("server.listenV6 is true but server.httpHostV6 is not set")
 			}
-			if s.HttpPort == nil {
-				return fmt.Errorf("server.listenV6 is true but server.httpPort is not set")
+			if s.HttpPortV6 == nil {
+				return fmt.Errorf("server.listenV6 is true but server.httpPortV6 is not set")
 			}
 		}
 	}
@@ -216,6 +218,34 @@ func (s *SharedStateConfig) Validate() error {
 	if s.FallbackTimeout == 0 {
 		return fmt.Errorf("sharedState.fallbackTimeout is required")
 	}
+	if s.FallbackTimeout.Duration() < 100*time.Millisecond {
+		return fmt.Errorf("sharedState.fallbackTimeout should be at least 100ms")
+	}
+	if s.LockTtl == 0 {
+		return fmt.Errorf("sharedState.lockTtl is required")
+	}
+	if s.LockTtl.Duration() < 1*time.Second {
+		return fmt.Errorf("sharedState.lockTtl should be at least 1s")
+	}
+
+	// Validate timeout relationships to prevent negative calculations in shared state flows
+	fallbackTimeout := s.FallbackTimeout.Duration()
+	lockTtl := s.LockTtl.Duration()
+
+	// TryUpdate uses operationBuffer = fallbackTimeout * 2
+	// Ensure lockTtl provides sufficient buffer for operations after lock acquisition
+	if fallbackTimeout*2 >= lockTtl {
+		return fmt.Errorf("sharedState.lockTtl (%v) must be greater than fallbackTimeout * 2 (%v) to prevent negative timeout calculations",
+			lockTtl, fallbackTimeout*2)
+	}
+
+	// TryUpdateIfStale uses operationBuffer = fallbackTimeout * 4 (more conservative)
+	// This is the more restrictive constraint and covers both update methods
+	if fallbackTimeout*4 >= lockTtl {
+		return fmt.Errorf("sharedState.lockTtl (%v) must be greater than fallbackTimeout * 4 (%v) to prevent negative timeout calculations",
+			lockTtl, fallbackTimeout*4)
+	}
+
 	return nil
 }
 
@@ -447,6 +477,11 @@ func (c *RedisConnectorConfig) Validate() error {
 	// Enforce supported schemes.
 	if !strings.HasPrefix(uri, "rediss://") && !strings.HasPrefix(uri, "redis://") {
 		return fmt.Errorf("redis connector: invalid URI scheme, must be 'rediss://' or 'redis://'")
+	}
+
+	// Validate lock retry interval
+	if c.LockRetryInterval.Duration() < 100*time.Millisecond && c.LockRetryInterval.Duration() > 0 {
+		return fmt.Errorf("redis.lockRetryInterval should be at least 100ms to avoid excessive Redis load")
 	}
 
 	return nil
@@ -832,6 +867,41 @@ func (c *CircuitBreakerPolicyConfig) Validate() error {
 	}
 	if c.SuccessThresholdCount > c.SuccessThresholdCapacity {
 		return fmt.Errorf("failsafe.circuitBreaker.successThresholdCount must be less than or equal to failureThresholdCapacity")
+	}
+	return nil
+}
+
+func (c *ConsensusPolicyConfig) Validate() error {
+	if c.RequiredParticipants > 0 {
+		log.Warn().Msg("consensus.requiredParticipants is deprecated, use consensus.maxParticipants instead")
+	}
+	if c.MaxParticipants <= 0 {
+		return fmt.Errorf("consensus.maxParticipants must be greater than 0")
+	}
+	if c.AgreementThreshold <= 0 {
+		return fmt.Errorf("consensus.agreementThreshold must be greater than 0")
+	}
+	if c.MaxParticipants < c.AgreementThreshold {
+		return fmt.Errorf("consensus.maxParticipants must be greater than or equal to agreementThreshold")
+	}
+	if c.PunishMisbehavior != nil {
+		if err := c.PunishMisbehavior.Validate(); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func (p *PunishMisbehaviorConfig) Validate() error {
+	if p.DisputeThreshold <= 0 {
+		return fmt.Errorf("consensus.punishMisbehavior.disputeThreshold must be greater than 0")
+	}
+	if p.DisputeWindow <= 0 {
+		return fmt.Errorf("consensus.punishMisbehavior.disputeWindow must be greater than 0")
+	}
+	if p.SitOutPenalty <= 0 {
+		return fmt.Errorf("consensus.punishMisbehavior.sitOutPenalty must be greater than 0")
 	}
 	return nil
 }

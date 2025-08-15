@@ -35,7 +35,6 @@ type GenericHttpJsonRpcClient struct {
 
 	projectId       string
 	upstream        common.Upstream
-	upstreamId      string
 	appCtx          context.Context
 	logger          *zerolog.Logger
 	httpClient      *http.Client
@@ -68,26 +67,26 @@ func NewGenericHttpJsonRpcClient(
 	jsonRpcCfg *common.JsonRpcUpstreamConfig,
 	proxyPool *ProxyPool,
 ) (HttpJsonRpcClient, error) {
-	upsId := "n/a"
-	if upstream != nil {
-		upsId = upstream.Id()
-	}
 	client := &GenericHttpJsonRpcClient{
 		Url:             parsedUrl,
 		appCtx:          appCtx,
 		logger:          logger,
 		projectId:       projectId,
 		upstream:        upstream,
-		upstreamId:      upsId,
 		proxyPool:       proxyPool,
 		isLogLevelTrace: logger.GetLevel() == zerolog.TraceLevel,
 	}
 
 	// Default fallback transport (no proxy)
+	// Optimized for high-latency, high-RPS scenarios to prevent connection churn
 	transport := &http.Transport{
-		MaxIdleConns:        1024,
-		MaxIdleConnsPerHost: 256,
-		IdleConnTimeout:     90 * time.Second,
+		MaxIdleConns:          1024,
+		MaxIdleConnsPerHost:   256,
+		MaxConnsPerHost:       0, // Unlimited active connections (prevents bottleneck)
+		IdleConnTimeout:       90 * time.Second,
+		ResponseHeaderTimeout: 30 * time.Second,
+		TLSHandshakeTimeout:   10 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
 	}
 
 	if util.IsTest() {
@@ -143,7 +142,7 @@ func (c *GenericHttpJsonRpcClient) SendRequest(ctx context.Context, req *common.
 	if err != nil {
 		return nil, common.NewErrUpstreamRequest(
 			err,
-			c.upstreamId,
+			c.upstream,
 			req.NetworkId(),
 			jrReq.Method,
 			0, 0, 0, 0,
@@ -326,7 +325,7 @@ func (c *GenericHttpJsonRpcClient) processBatch(alreadyLocked bool) {
 		if err != nil {
 			req.err <- common.NewErrUpstreamRequest(
 				err,
-				c.upstreamId,
+				c.upstream,
 				req.request.NetworkId(),
 				jrReq.Method,
 				0, 0, 0, 0,
@@ -367,7 +366,7 @@ func (c *GenericHttpJsonRpcClient) processBatch(alreadyLocked bool) {
 				Message: fmt.Sprintf("%v", err),
 				Details: map[string]interface{}{
 					"url":        c.Url.String(),
-					"upstreamId": c.upstreamId,
+					"upstreamId": c.upstream.Id(),
 					"request":    requestBody,
 				},
 			}
@@ -452,7 +451,9 @@ func (c *GenericHttpJsonRpcClient) processBatchResponse(requests map[interface{}
 				nr := common.NewNormalizedResponse().
 					WithRequest(req.request).
 					WithJsonRpcResponse(jrr)
+				// We only need nr to normalize the error; ensure it does not leak.
 				err = c.normalizeJsonRpcError(resp, nr)
+				nr.Release()
 				req.err <- err
 			}
 		}
@@ -478,10 +479,13 @@ func (c *GenericHttpJsonRpcClient) processBatchResponse(requests map[interface{}
 			} else if req, ok := requests[id]; ok {
 				nr := common.NewNormalizedResponse().WithRequest(req.request).WithJsonRpcResponse(jrResp)
 				if err != nil {
+					// Defensive: although err is from getJsonRpcResponseFromNode, release nr just in case
+					nr.Release()
 					req.err <- err
 				} else {
 					err := c.normalizeJsonRpcError(resp, nr)
 					if err != nil {
+						nr.Release()
 						req.err <- err
 					} else {
 						req.response <- nr
@@ -514,6 +518,7 @@ func (c *GenericHttpJsonRpcClient) processBatchResponse(requests map[interface{}
 			nr := common.NewNormalizedResponse().WithRequest(req.request).WithJsonRpcResponse(jrResp)
 			err := c.normalizeJsonRpcError(resp, nr)
 			if err != nil {
+				nr.Release()
 				req.err <- err
 			} else {
 				req.response <- nr
@@ -522,7 +527,7 @@ func (c *GenericHttpJsonRpcClient) processBatchResponse(requests map[interface{}
 	} else {
 		// Unexpected response type
 		for _, req := range requests {
-			req.err <- common.NewErrUpstreamMalformedResponse(fmt.Errorf("unexpected response type (not array nor object): %s", bodyStr), c.upstreamId)
+			req.err <- common.NewErrUpstreamMalformedResponse(fmt.Errorf("unexpected response type (not array nor object): %s", bodyStr), c.upstream)
 		}
 	}
 }
@@ -566,7 +571,7 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 	ctx, span := common.StartSpan(ctx, "HttpJsonRpcClient.sendSingleRequest",
 		trace.WithAttributes(
 			attribute.String("network.id", req.NetworkId()),
-			attribute.String("upstream.id", c.upstreamId),
+			attribute.String("upstream.id", c.upstream.Id()),
 		),
 	)
 	defer span.End()
@@ -583,7 +588,7 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 		common.SetTraceSpanError(span, err)
 		return nil, common.NewErrUpstreamRequest(
 			err,
-			c.upstreamId,
+			c.upstream,
 			req.NetworkId(),
 			jrReq.Method,
 			0,
@@ -616,7 +621,7 @@ func (c *GenericHttpJsonRpcClient) sendSingleRequest(ctx context.Context, req *c
 			Message: fmt.Sprintf("%v", err),
 			Details: map[string]interface{}{
 				"url":        c.Url.String(),
-				"upstreamId": c.upstreamId,
+				"upstreamId": c.upstream.Id(),
 				"request":    requestBody,
 			},
 		}
@@ -772,7 +777,7 @@ func (c *GenericHttpJsonRpcClient) normalizeJsonRpcError(r *http.Response, nr *c
 			"could not parse json rpc response from upstream",
 			err,
 			map[string]interface{}{
-				"upstreamId": c.upstreamId,
+				"upstreamId": c.upstream.Id(),
 				"statusCode": r.StatusCode,
 				"headers":    r.Header,
 			},
@@ -796,7 +801,7 @@ func (c *GenericHttpJsonRpcClient) normalizeJsonRpcError(r *http.Response, nr *c
 		"unknown json-rpc error",
 		jr.Error,
 		map[string]interface{}{
-			"upstreamId": c.upstreamId,
+			"upstreamId": c.upstream.Id(),
 			"statusCode": r.StatusCode,
 			"headers":    r.Header,
 		},
