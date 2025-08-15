@@ -2429,7 +2429,7 @@ func setupNetworkForConsensusTest(t *testing.T, ctx context.Context, tc consensu
 				},
 			},
 		},
-		nil, upsReg, mt,
+		nil, upsReg, mt, ssr,
 	)
 	require.NoError(t, err)
 

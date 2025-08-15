@@ -216,6 +216,8 @@ func (r *sharedStateRegistry) DeleteString(ctx context.Context, key string) erro
 	// Set with zero TTL effectively deletes the key in most storage systems
 	zeroDuration := time.Duration(0)
 	return r.connector.Set(ctx, fkey, "value", nil, &zeroDuration)
+}
+
 func (r *sharedStateRegistry) GetLockTtl() time.Duration {
 	return r.lockTtl
 }
