@@ -563,8 +563,23 @@ func (s *ServerConfig) SetDefaults() error {
 	if s.HttpHostV6 == nil {
 		s.HttpHostV6 = util.StringPtr("[::]")
 	}
+	// Handle deprecated HttpPort -> HttpPortV4 migration
+	if s.HttpPort != nil && s.HttpPortV4 == nil {
+		s.HttpPortV4 = s.HttpPort // Migrate deprecated field
+	}
+	if s.HttpPortV4 == nil {
+		s.HttpPortV4 = util.IntPtr(4000)
+	}
+	// Keep HttpPort for backward compatibility (will be same as HttpPortV4)
 	if s.HttpPort == nil {
-		s.HttpPort = util.IntPtr(4000)
+		s.HttpPort = s.HttpPortV4
+	}
+	// Handle deprecated HttpPort -> HttpPortV6 migration for backward compatibility
+	if s.HttpPort != nil && s.HttpPortV6 == nil {
+		s.HttpPortV6 = util.IntPtr(*s.HttpPort + 1000)
+	}
+	if s.HttpPortV6 == nil {
+		s.HttpPortV6 = util.IntPtr(5000) // Default: avoid 4001 (metrics)
 	}
 	if s.MaxTimeout == nil {
 		d := Duration(150 * time.Second)
@@ -668,7 +683,9 @@ func (c *SharedStateConfig) SetDefaults(defClusterKey string) error {
 		return err
 	}
 	if c.FallbackTimeout == 0 {
-		c.FallbackTimeout = Duration(10 * time.Second)
+		// Default timeout for Redis operations (get/set/publish)
+		// Allow sufficient time for network latency to cloud Redis while still failing fast
+		c.FallbackTimeout = Duration(3 * time.Second)
 	}
 	if c.LockTtl == 0 {
 		c.LockTtl = Duration(30 * time.Second)
@@ -761,12 +778,8 @@ func (r *RedisConnectorConfig) SetDefaults() error {
 		)
 	}
 
-	// URI is provided directly
-	if r.URI != "" {
-		return nil
-	}
-
 	// Set default values for timeouts and connection pool size
+	// This must happen BEFORE the URI check to ensure timeouts are always set
 	if r.ConnPoolSize == 0 {
 		r.ConnPoolSize = 8
 	}
@@ -777,10 +790,15 @@ func (r *RedisConnectorConfig) SetDefaults() error {
 		r.GetTimeout = Duration(1 * time.Second)
 	}
 	if r.SetTimeout == 0 {
-		r.SetTimeout = Duration(2 * time.Second)
+		r.SetTimeout = Duration(3 * time.Second)
 	}
 	if r.LockRetryInterval == 0 {
-		r.LockRetryInterval = Duration(300 * time.Millisecond)
+		r.LockRetryInterval = Duration(500 * time.Millisecond)
+	}
+
+	// URI is provided directly
+	if r.URI != "" {
+		return nil
 	}
 
 	// URI needs to be constructed from individual fields
@@ -1357,10 +1375,6 @@ func (u *UpstreamConfig) SetDefaults(defaults *UpstreamConfig) error {
 						break
 					}
 				}
-				// If no specific match found, use first default as general default
-				if defaultFs == nil && len(defaults.Failsafe) > 0 {
-					defaultFs = defaults.Failsafe[0]
-				}
 				if defaultFs != nil {
 					if err := fs.SetDefaults(defaultFs); err != nil {
 						return fmt.Errorf("failed to set defaults for failsafe[%d]: %w", i, err)
@@ -1764,6 +1778,11 @@ func (f *FailsafeConfig) SetDefaults(defaults *FailsafeConfig) error {
 			return fmt.Errorf("failed to set defaults for circuit breaker: %w", err)
 		}
 	}
+	if f.Consensus != nil {
+		if err := f.Consensus.SetDefaults(); err != nil {
+			return fmt.Errorf("failed to set defaults for consensus: %w", err)
+		}
+	}
 
 	return nil
 }
@@ -1905,6 +1924,51 @@ func (c *CircuitBreakerPolicyConfig) SetDefaults(defaults *CircuitBreakerPolicyC
 		} else {
 			c.SuccessThresholdCapacity = 10
 		}
+	}
+
+	return nil
+}
+
+func (c *ConsensusPolicyConfig) SetDefaults() error {
+	if c.RequiredParticipants > 0 {
+		// @deprecated: use MaxParticipants instead
+		c.MaxParticipants = c.RequiredParticipants
+	}
+	if c.MaxParticipants == 0 {
+		c.MaxParticipants = 5
+	}
+	if c.AgreementThreshold == 0 {
+		c.AgreementThreshold = 2
+	}
+	if c.DisputeBehavior == "" {
+		c.DisputeBehavior = ConsensusDisputeBehaviorReturnError
+	}
+	if c.LowParticipantsBehavior == "" {
+		c.LowParticipantsBehavior = ConsensusLowParticipantsBehaviorAcceptMostCommonValidResult
+	}
+	if c.DisputeLogLevel == "" {
+		c.DisputeLogLevel = "warn"
+	}
+	if c.IgnoreFields == nil {
+		c.IgnoreFields = map[string][]string{
+			"eth_getLogs": {
+				"*.blockTimestamp",
+			},
+			"eth_getTransactionReceipt": {
+				"blockTimestamp",
+				"logs.*.blockTimestamp",
+			},
+			"eth_getBlockReceipts": {
+				"*.blockTimestamp",
+				"*.logs.*.blockTimestamp",
+			},
+		}
+	}
+	if c.PreferNonEmpty == nil {
+		c.PreferNonEmpty = util.BoolPtr(true)
+	}
+	if c.PreferLargerResponses == nil {
+		c.PreferLargerResponses = util.BoolPtr(true)
 	}
 
 	return nil

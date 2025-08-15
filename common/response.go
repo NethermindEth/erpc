@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/erpc/erpc/util"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 )
@@ -18,11 +19,11 @@ type NormalizedResponse struct {
 	body         io.ReadCloser
 	expectedSize int
 
-	fromCache bool
+	fromCache atomic.Bool
 	attempts  atomic.Value
 	retries   atomic.Value
 	hedges    atomic.Value
-	upstream  Upstream
+	upstream  atomic.Value
 
 	jsonRpcResponse atomic.Pointer[JsonRpcResponse]
 	evmBlockNumber  atomic.Value
@@ -83,11 +84,14 @@ func (r *NormalizedResponse) FromCache() bool {
 	if r == nil {
 		return false
 	}
-	return r.fromCache
+	return r.fromCache.Load()
 }
 
 func (r *NormalizedResponse) SetFromCache(fromCache bool) *NormalizedResponse {
-	r.fromCache = fromCache
+	if r == nil {
+		return r
+	}
+	r.fromCache.Store(fromCache)
 	return r
 }
 
@@ -191,37 +195,60 @@ func (r *NormalizedResponse) SetHedges(hedges int) *NormalizedResponse {
 }
 
 func (r *NormalizedResponse) Upstream() Upstream {
-	if r == nil || r.upstream == nil {
+	if r == nil {
+		return nil
+	}
+	upstream := r.upstream.Load()
+	if upstream == nil {
 		return nil
 	}
 
-	return r.upstream
+	return upstream.(Upstream)
 }
 
 func (r *NormalizedResponse) UpstreamId() string {
-	if r == nil || r.upstream == nil {
+	if r == nil {
+		return ""
+	}
+	upstream := r.upstream.Load()
+	if upstream == nil {
 		return ""
 	}
 
-	if r.upstream.Config() == nil {
+	up := upstream.(Upstream)
+	if up.Config() == nil {
 		return ""
 	}
 
-	return r.upstream.Id()
+	return up.Id()
 }
 
 func (r *NormalizedResponse) SetUpstream(upstream Upstream) *NormalizedResponse {
-	r.upstream = upstream
+	if r == nil {
+		return r
+	}
+
+	if upstream != nil {
+		r.upstream.Store(upstream)
+	}
 	return r
 }
 
 func (r *NormalizedResponse) WithRequest(req *NormalizedRequest) *NormalizedResponse {
+	if r == nil {
+		return r
+	}
+	r.Lock()
+	defer r.Unlock()
 	r.request = req
 	return r
 }
 
 func (r *NormalizedResponse) WithFromCache(fromCache bool) *NormalizedResponse {
-	r.fromCache = fromCache
+	if r == nil {
+		return r
+	}
+	r.fromCache.Store(fromCache)
 	return r
 }
 
@@ -242,9 +269,12 @@ func (r *NormalizedResponse) JsonRpcResponse(ctx ...context.Context) (*JsonRpcRe
 
 	// Ensure parsing happens only once
 	r.parseOnce.Do(func() {
-		if r.body != nil {
+		body := r.body
+		expectedSize := r.expectedSize
+
+		if body != nil {
 			jrr := &JsonRpcResponse{}
-			err := jrr.ParseFromStream(ctx, r.body, r.expectedSize)
+			err := jrr.ParseFromStream(ctx, body, expectedSize)
 			if err != nil {
 				r.parseErr = err
 				return
@@ -263,11 +293,21 @@ func (r *NormalizedResponse) JsonRpcResponse(ctx ...context.Context) (*JsonRpcRe
 }
 
 func (r *NormalizedResponse) WithBody(body io.ReadCloser) *NormalizedResponse {
+	if r == nil {
+		return r
+	}
+	r.Lock()
+	defer r.Unlock()
 	r.body = body
 	return r
 }
 
 func (r *NormalizedResponse) WithExpectedSize(expectedSize int) *NormalizedResponse {
+	if r == nil {
+		return r
+	}
+	r.Lock()
+	defer r.Unlock()
 	r.expectedSize = expectedSize
 	return r
 }
@@ -281,6 +321,8 @@ func (r *NormalizedResponse) Request() *NormalizedRequest {
 	if r == nil {
 		return nil
 	}
+	r.RLock()
+	defer r.RUnlock()
 	return r.request
 }
 
@@ -291,10 +333,43 @@ func (r *NormalizedResponse) IsResultEmptyish(ctx ...context.Context) bool {
 	}
 
 	if jrr != nil {
-		return jrr.IsResultEmptyish(ctx...)
+		// Check generic emptyish first
+		emptyish := jrr.IsResultEmptyish(ctx...)
+		if emptyish {
+			return true
+		}
+
+		// If not generically emptyish, check EVM-specific emptyish conditions
+		return r.isEvmResultEmptyish(jrr, ctx...)
 	}
 
 	return true
+}
+
+func (r *NormalizedResponse) isEvmResultEmptyish(jrr *JsonRpcResponse, ctx ...context.Context) bool {
+	if r.request == nil || r.request.network == nil || r.request.network.Architecture() != ArchitectureEvm {
+		return false
+	}
+
+	if len(ctx) == 0 {
+		ctx = []context.Context{context.Background()}
+	}
+
+	method, _ := r.request.Method()
+	switch method {
+	case "eth_getTransactionReceipt":
+		logsBytes, err := jrr.PeekBytesByPath(ctx[0], "logs")
+		if err != nil {
+			// If we can't peek the logs field, consider it not emptyish
+			return false
+		}
+
+		// Use the existing utility to check if the bytes represent an empty array
+		// This handles cases like "[]" (empty array) with zero memory copy
+		return util.IsBytesEmptyish(logsBytes)
+	}
+
+	return false
 }
 
 func (r *NormalizedResponse) IsObjectNull(ctx ...context.Context) bool {
@@ -325,9 +400,6 @@ func (r *NormalizedResponse) IsObjectNull(ctx ...context.Context) bool {
 }
 
 func (r *NormalizedResponse) MarshalJSON() ([]byte, error) {
-	r.RLock()
-	defer r.RUnlock()
-
 	if jrr := r.jsonRpcResponse.Load(); jrr != nil {
 		return SonicCfg.Marshal(jrr)
 	}
@@ -364,6 +436,11 @@ func (r *NormalizedResponse) Release() {
 		r.body = nil
 	}
 
+	// Aggressively free heavy fields of JsonRpcResponse before dropping the pointer
+	if jrr := r.jsonRpcResponse.Load(); jrr != nil {
+		jrr.Free()
+	}
+
 	r.jsonRpcResponse.Store(nil)
 }
 
@@ -372,18 +449,22 @@ func (r *NormalizedResponse) MarshalZerologObject(e *zerolog.Event) {
 		return
 	}
 
-	e.Bool("fromCache", r.fromCache)
+	fromCache := r.fromCache.Load()
+	upstream := r.upstream.Load()
+
+	e.Bool("fromCache", fromCache)
 	e.Int("attempts", r.Attempts())
 	e.Int("retries", r.Retries())
 	e.Int("hedges", r.Hedges())
 	e.Interface("evmBlockRef", r.evmBlockRef.Load())
 	e.Interface("evmBlockNumber", r.evmBlockNumber.Load())
 
-	if r.upstream != nil {
-		if r.upstream.Config() != nil {
-			e.Str("upstream", r.upstream.Id())
+	if upstream != nil {
+		up := upstream.(Upstream)
+		if up.Config() != nil {
+			e.Str("upstream", up.Id())
 		} else {
-			e.Str("upstream", fmt.Sprintf("%p", r.upstream))
+			e.Str("upstream", fmt.Sprintf("%p", up))
 		}
 	} else {
 		e.Str("upstream", "nil")

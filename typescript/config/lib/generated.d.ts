@@ -374,7 +374,7 @@ export declare const ConsensusDisputeBehaviorAcceptMostCommonValidResult: Consen
 export declare const ConsensusDisputeBehaviorPreferBlockHeadLeader: ConsensusDisputeBehavior;
 export declare const ConsensusDisputeBehaviorOnlyBlockHeadLeader: ConsensusDisputeBehavior;
 export interface ConsensusPolicyConfig {
-    requiredParticipants: number;
+    maxParticipants: number;
     agreementThreshold?: number;
     disputeBehavior?: ConsensusDisputeBehavior;
     lowParticipantsBehavior?: ConsensusLowParticipantsBehavior;
@@ -457,6 +457,7 @@ export interface SelectionPolicyConfig {
 }
 export type AuthType = string;
 export declare const AuthTypeSecret: AuthType;
+export declare const AuthTypeDatabase: AuthType;
 export declare const AuthTypeJwt: AuthType;
 export declare const AuthTypeSiwe: AuthType;
 export declare const AuthTypeNetwork: AuthType;
@@ -470,11 +471,23 @@ export interface AuthStrategyConfig {
     type: TsAuthType;
     network?: NetworkStrategyConfig;
     secret?: SecretStrategyConfig;
+    database?: DatabaseStrategyConfig;
     jwt?: JwtStrategyConfig;
     siwe?: SiweStrategyConfig;
 }
 export interface SecretStrategyConfig {
+    id: string;
     value: string;
+}
+export interface DatabaseStrategyConfig {
+    connector?: ConnectorConfig;
+    cache?: DatabaseStrategyCacheConfig;
+}
+export interface DatabaseStrategyCacheConfig {
+    ttl?: number;
+    maxSize?: number;
+    maxCost?: number;
+    numCounters?: number;
 }
 export interface JwtStrategyConfig {
     allowedIssuers: string[];
@@ -551,4 +564,8 @@ export declare const ScopeNetwork: Scope;
 export declare const ScopeUpstream: Scope;
 export type UpstreamType = string;
 export type Upstream = any;
+export interface User {
+    id: string;
+    persecondratelimit: number;
+}
 //# sourceMappingURL=generated.d.ts.map

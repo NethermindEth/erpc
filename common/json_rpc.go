@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unsafe"
 
 	"github.com/bytedance/sonic/ast"
 	"github.com/erpc/erpc/util"
@@ -19,6 +20,8 @@ import (
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 )
+
+var defaultCanonicalHashPlaceholder = interface{}(0) // placeholder for canonical hash
 
 type JsonRpcResponse struct {
 	// ID is mainly set based on incoming request.
@@ -47,9 +50,47 @@ type JsonRpcResponse struct {
 	resultMu     sync.RWMutex
 	cachedNode   *ast.Node
 
-	// canonicalHash caches the canonical hash of the Result to avoid recomputing it.
-	// It is populated lazily on the first call to CanonicalHash using atomic.Value for thread-safe access.
-	canonicalHash atomic.Value
+	// canonicalHashWithIgnored caches hashes computed with ignored fields
+	// Key is the pointer to the first element of the ignoreFields slice (if non-empty)
+	// This works because consensus policy reuses the same slice for the same ignore patterns
+	canonicalHashWithIgnored sync.Map
+}
+
+// Free releases heavy, memory-retaining fields so that upstream response buffers
+// can be garbage collected as soon as the response is no longer needed.
+//
+// This method is safe to call after the response has been fully consumed
+// (written to client or converted by callers). It must not be used while
+// there are concurrent readers of this object.
+func (r *JsonRpcResponse) Free() {
+	if r == nil {
+		return
+	}
+
+	// Clear ID bytes
+	r.idMu.Lock()
+	r.idBytes = nil
+	// keep r.id as is for logging if needed; it's tiny
+	r.idMu.Unlock()
+
+	// Clear error bytes
+	r.errMu.Lock()
+	r.errBytes = nil
+	// keep r.Error reference small
+	r.errMu.Unlock()
+
+	// Clear result-related auxiliary fields but keep Result bytes intact to avoid
+	// data races with concurrent readers that may still hold a reference to this response.
+	r.resultMu.Lock()
+	r.resultWriter = nil
+	r.cachedNode = nil
+	r.resultMu.Unlock()
+
+	// Clear canonical hash caches
+	r.canonicalHashWithIgnored.Range(func(key, _ any) bool {
+		r.canonicalHashWithIgnored.Delete(key)
+		return true
+	})
 }
 
 func NewJsonRpcResponse(id interface{}, result interface{}, rpcError *ErrJsonRpcExceptionExternal) (*JsonRpcResponse, error) {
@@ -311,17 +352,49 @@ func (r *JsonRpcResponse) PeekStringByPath(ctx context.Context, path ...interfac
 	return n.String()
 }
 
+func (r *JsonRpcResponse) PeekBytesByPath(ctx context.Context, path ...interface{}) ([]byte, error) {
+	_, span := StartDetailSpan(ctx, "JsonRpcResponse.PeekBytesByPath")
+	defer span.End()
+
+	err := r.ensureCachedNode()
+	if err != nil {
+		return nil, err
+	}
+
+	r.resultMu.Lock()
+	defer r.resultMu.Unlock()
+	n := r.cachedNode.GetByPath(path...)
+	if n == nil {
+		return nil, fmt.Errorf("could not get '%s' from json-rpc response", path)
+	}
+	if n.Error() != "" {
+		return nil, fmt.Errorf("error getting '%s' from json-rpc response: %s", path, n.Error())
+	}
+
+	// Use Raw() method to get zero-copy access to the underlying JSON bytes
+	rawStr, err := n.Raw()
+	if err != nil {
+		return nil, fmt.Errorf("error getting raw JSON from node: %s", err)
+	}
+	return util.S2Bytes(rawStr), nil
+}
+
 func (r *JsonRpcResponse) Size(ctx ...context.Context) (int, error) {
 	if r == nil {
 		return 0, nil
 	}
 
-	if len(r.Result) > 0 {
-		return len(r.Result), nil
+	r.resultMu.RLock()
+	rl := len(r.Result)
+	hasResult := rl > 0
+	rw := r.resultWriter
+	r.resultMu.RUnlock()
+	if hasResult {
+		return rl, nil
 	}
 
-	if r.resultWriter != nil {
-		return r.resultWriter.Size(ctx...)
+	if rw != nil {
+		return rw.Size(ctx...)
 	}
 	return 0, nil
 }
@@ -496,6 +569,9 @@ func (r *JsonRpcResponse) WriteResultTo(w io.Writer, trimSides bool) (n int64, e
 
 	if len(r.Result) > 0 {
 		if trimSides {
+			if len(r.Result) <= 2 {
+				return 0, nil
+			}
 			nn, err := w.Write(r.Result[1 : len(r.Result)-1])
 			return int64(nn), err
 		}
@@ -519,9 +595,11 @@ func (r *JsonRpcResponse) Clone() (*JsonRpcResponse, error) {
 	defer r.resultMu.RUnlock()
 
 	clone := &JsonRpcResponse{
-		id:         r.id,
-		Error:      r.Error,
-		cachedNode: r.cachedNode,
+		id:    r.id,
+		Error: r.Error,
+		// Do NOT copy cachedNode to avoid retaining original upstream buffer via AST.
+		// It will be lazily rebuilt from clone.Result if needed.
+		cachedNode: nil,
 	}
 
 	// Deep copy byte slices to avoid shared references
@@ -541,8 +619,8 @@ func (r *JsonRpcResponse) Clone() (*JsonRpcResponse, error) {
 	}
 
 	// Copy the canonical hash if it exists
-	if cached := r.canonicalHash.Load(); cached != nil {
-		clone.canonicalHash.Store(cached)
+	if cached, ok := r.canonicalHashWithIgnored.Load(defaultCanonicalHashPlaceholder); ok {
+		clone.canonicalHashWithIgnored.Store(defaultCanonicalHashPlaceholder, cached)
 	}
 
 	clone.resultWriter = r.resultWriter
@@ -595,7 +673,7 @@ func (r *JsonRpcResponse) CanonicalHash(ctx ...context.Context) (string, error) 
 	}
 
 	// Fast-path: if already computed, return immediately
-	if cached := r.canonicalHash.Load(); cached != nil {
+	if cached, ok := r.canonicalHashWithIgnored.Load(defaultCanonicalHashPlaceholder); ok {
 		return cached.(string), nil
 	}
 
@@ -605,7 +683,7 @@ func (r *JsonRpcResponse) CanonicalHash(ctx ...context.Context) (string, error) 
 	r.resultMu.RUnlock()
 
 	var obj interface{}
-	if err := json.Unmarshal(resultCopy, &obj); err != nil {
+	if err := SonicCfg.Unmarshal(resultCopy, &obj); err != nil {
 		return "", err
 	}
 
@@ -618,7 +696,7 @@ func (r *JsonRpcResponse) CanonicalHash(ctx ...context.Context) (string, error) 
 	hash := fmt.Sprintf("%x", b)
 
 	// Store the computed hash atomically
-	r.canonicalHash.Store(hash)
+	r.canonicalHashWithIgnored.Store(defaultCanonicalHashPlaceholder, hash)
 
 	return hash, nil
 }
@@ -629,20 +707,35 @@ func (r *JsonRpcResponse) CanonicalHashWithIgnoredFields(ignoreFields []string, 
 		return "", nil
 	}
 
-	// Compute hash with ignored fields (no caching for this variant)
+	// If no fields to ignore, use regular canonical hash
+	if len(ignoreFields) == 0 {
+		return r.CanonicalHash(ctx...)
+	}
+
+	// Use the slice's underlying array pointer as cache key
+	// This is safe because consensus policy reuses the same slice for the same ignore patterns
+	var cacheKey unsafe.Pointer
+	if len(ignoreFields) > 0 {
+		cacheKey = unsafe.Pointer(&ignoreFields[0]) // #nosec G103
+	}
+
+	// Check cache first
+	if cached, ok := r.canonicalHashWithIgnored.Load(cacheKey); ok {
+		return cached.(string), nil
+	}
+
+	// Compute hash with ignored fields
 	r.resultMu.RLock()
 	resultCopy := r.Result
 	r.resultMu.RUnlock()
 
 	var obj interface{}
-	if err := json.Unmarshal(resultCopy, &obj); err != nil {
+	if err := SonicCfg.Unmarshal(resultCopy, &obj); err != nil {
 		return "", err
 	}
 
 	// Remove ignored fields before canonicalization
-	if len(ignoreFields) > 0 {
-		obj = removeFieldsByPaths(obj, ignoreFields)
-	}
+	obj = removeFieldsByPaths(obj, ignoreFields)
 
 	canonical, err := canonicalize(obj)
 	if err != nil {
@@ -651,6 +744,9 @@ func (r *JsonRpcResponse) CanonicalHashWithIgnoredFields(ignoreFields []string, 
 
 	b := sha256.Sum256(canonical)
 	hash := fmt.Sprintf("%x", b)
+
+	// Store in cache
+	r.canonicalHashWithIgnored.Store(cacheKey, hash)
 
 	return hash, nil
 }
@@ -778,7 +874,7 @@ func canonicalize(v interface{}) ([]byte, error) {
 			}
 			first = false
 
-			kj, _ := json.Marshal(k)
+			kj, _ := SonicCfg.Marshal(k)
 			buf.Write(kj)
 			buf.WriteByte(':')
 			buf.Write(vj)
@@ -844,7 +940,7 @@ func canonicalize(v interface{}) ([]byte, error) {
 		return removeLeadingZeroes(val), nil
 
 	default:
-		b, err := json.Marshal(val)
+		b, err := SonicCfg.Marshal(val)
 		if err != nil {
 			return nil, err
 		}
@@ -902,14 +998,13 @@ func isEmptyishValue(v interface{}) bool {
 		// Empty objects are considered empty
 		return len(val) == 0
 	case float64:
-		// Don't treat 0 as emptyish - it's a valid value for many fields
 		return val == 0
 	case bool:
 		// Booleans are never emptyish
 		return false
 	default:
 		// For other types, marshal and check
-		b, err := json.Marshal(val)
+		b, err := SonicCfg.Marshal(val)
 		if err != nil {
 			return false
 		}

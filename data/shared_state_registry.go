@@ -18,6 +18,8 @@ type SharedStateRegistry interface {
 	SetString(ctx context.Context, key string, value string, ttl *time.Duration) error
 	GetString(ctx context.Context, key string) (string, error)
 	DeleteString(ctx context.Context, key string) error
+	GetLockTtl() time.Duration
+	GetFallbackTimeout() time.Duration
 }
 
 type sharedStateRegistry struct {
@@ -104,7 +106,7 @@ func (r *sharedStateRegistry) buildInitialValueTask(counter *counterInt64) *util
 			}
 			r.logger.Debug().Str("key", counter.key).Int64("value", v).Msg("fetched initial value for counter")
 			if v > 0 {
-				counter.processNewValue(v)
+				counter.processNewValue(UpdateSourceInitialFetch, v)
 			}
 			return nil
 		},
@@ -153,11 +155,11 @@ func (r *sharedStateRegistry) initCounterSync(counter *counterInt64) error {
 					return
 				}
 
-				r.logger.Debug().
+				r.logger.Info().
 					Str("key", counter.key).
 					Int64("newValue", newValue).
-					Msg("received new value from shared state")
-				counter.processNewValue(newValue)
+					Msg("received new value from shared state sync")
+				counter.processNewValue(UpdateSourceRemoteSync, newValue)
 			}
 		}
 	}()
@@ -180,7 +182,7 @@ func (r *sharedStateRegistry) fetchValue(ctx context.Context, key string) (int64
 	}
 
 	var remoteValue int64
-	if remoteVal != nil && len(remoteVal) > 0 {
+	if len(remoteVal) > 0 {
 		if _, err := fmt.Sscanf(string(remoteVal), "%d", &remoteValue); err != nil {
 			return 0, err
 		}
@@ -214,4 +216,10 @@ func (r *sharedStateRegistry) DeleteString(ctx context.Context, key string) erro
 	// Set with zero TTL effectively deletes the key in most storage systems
 	zeroDuration := time.Duration(0)
 	return r.connector.Set(ctx, fkey, "value", nil, &zeroDuration)
+func (r *sharedStateRegistry) GetLockTtl() time.Duration {
+	return r.lockTtl
+}
+
+func (r *sharedStateRegistry) GetFallbackTimeout() time.Duration {
+	return r.fallbackTimeout
 }

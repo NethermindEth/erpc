@@ -24,10 +24,11 @@ import (
 )
 
 type FailsafeExecutor struct {
-	method     string
-	finalities []common.DataFinalityState
-	executor   failsafe.Executor[*common.NormalizedResponse]
-	timeout    *time.Duration
+	method                 string
+	finalities             []common.DataFinalityState
+	executor               failsafe.Executor[*common.NormalizedResponse]
+	timeout                *time.Duration
+	consensusPolicyEnabled bool
 }
 
 type Network struct {
@@ -468,12 +469,16 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 			)
 			defer execSpan.End()
 
-			overridenReq := execSpanCtx.Value(common.RequestContextKey)
 			// Use a local variable to avoid overwriting the captured req variable
 			// which can cause issues when multiple executions run concurrently (e.g., consensus)
+			// Be defensive about the type assertion to avoid panics if the context value was not set properly.
 			var effectiveReq *common.NormalizedRequest
-			if overridenReq != nil {
-				effectiveReq = overridenReq.(*common.NormalizedRequest)
+			if or := execSpanCtx.Value(common.RequestContextKey); or != nil {
+				if r, ok := or.(*common.NormalizedRequest); ok && r != nil {
+					effectiveReq = r
+				} else {
+					effectiveReq = req
+				}
 			} else {
 				effectiveReq = req
 			}
@@ -566,6 +571,11 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 					ulg.Debug().Err(err).Msgf("discarding hedged request to upstream")
 					finality := effectiveReq.Finality(loopCtx)
 					telemetry.MetricNetworkHedgeDiscardsTotal.WithLabelValues(n.projectId, n.networkId, u.Id(), method, fmt.Sprintf("%d", attempts), fmt.Sprintf("%d", hedges), finality.String(), effectiveReq.UserId(), effectiveReq.AgentName(), effectiveReq.AgentVersion()).Inc()
+					// Release any response associated with the discarded hedge to avoid retaining buffers
+					if r != nil {
+						r.Release()
+						r = nil
+					}
 					err := common.NewErrUpstreamHedgeCancelled(u.Id(), err)
 					common.SetTraceSpanError(loopSpan, err)
 					return nil, err
@@ -588,13 +598,25 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 						common.SetTraceSpanError(loopSpan, err)
 					}
 					if r != nil {
-						// Store execution metadata inside the response for later use.
-						r.SetAttempts(exec.Attempts())
-						r.SetRetries(exec.Retries())
-						r.SetHedges(exec.Hedges())
+						if err == nil {
+							// Store execution metadata only for winning attempts
+							r.SetAttempts(exec.Attempts())
+							r.SetRetries(exec.Retries())
+							r.SetHedges(exec.Hedges())
+						} else {
+							// On error, release non-winning responses
+							r.Release()
+							r = nil
+						}
 					}
 					loopSpan.End()
 					return r, err
+				}
+
+				// For skipped requests, ensure any response is not retained before continuing
+				if r != nil {
+					r.Release()
+					r = nil
 				}
 
 				loopSpan.End()
@@ -621,10 +643,17 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 
 	if execErr != nil {
 		translatedErr := upstream.TranslateFailsafeError(common.ScopeNetwork, "", method, execErr, &startTime)
-		// Don't override consensus errors with last valid response
-		if common.HasErrorCode(translatedErr, common.ErrCodeConsensusDispute, common.ErrCodeConsensusLowParticipants) {
+		// Don't override consensus results with last valid response from individual upstreams
+		// For example if 1 upstream gives empty response another 3 give "reverted" error,
+		// we should still return reverted error, even though there was an empty response before.
+		if failsafeExecutor.consensusPolicyEnabled {
 			if mlx != nil {
 				mlx.Close(ctx, nil, translatedErr)
+			}
+			// Ensure any lastValidResponse kept on the request is released and cleared
+			if lvr := req.LastValidResponse(); lvr != nil {
+				lvr.Release()
+				req.ClearLastValidResponse()
 			}
 			return nil, translatedErr
 		}
@@ -734,6 +763,14 @@ func (n *Network) Forward(ctx context.Context, req *common.NormalizedRequest) (*
 
 	if mlx != nil {
 		mlx.Close(ctx, resp, nil)
+	}
+
+	// After consensus success, ensure we don't keep a loser in req.LastValidResponse
+	if failsafeExecutor.consensusPolicyEnabled {
+		if lvr := req.LastValidResponse(); lvr != nil && lvr != resp {
+			lvr.Release()
+			req.ClearLastValidResponse()
+		}
 	}
 
 	return resp, nil
@@ -1221,13 +1258,12 @@ func (n *Network) normalizeResponse(ctx context.Context, req *common.NormalizedR
 		if resp != nil {
 			// This ensures that even if upstream gives us wrong/missing ID we'll
 			// use correct one from original incoming request.
-			if jrr, err := resp.JsonRpcResponse(ctx); err == nil {
+			if jrr, err := resp.JsonRpcResponse(ctx); err == nil && jrr != nil {
 				jrq, err := req.JsonRpcRequest(ctx)
 				if err != nil {
 					return err
 				}
-				err = jrr.SetID(jrq.ID)
-				if err != nil {
+				if err := jrr.SetID(jrq.ID); err != nil {
 					return err
 				}
 			}
